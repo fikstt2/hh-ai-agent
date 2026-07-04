@@ -1,0 +1,10 @@
+.env
+state.json
+agent.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.vscode/
+.idea/
