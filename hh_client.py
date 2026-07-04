@@ -2,7 +2,7 @@ import os
 import asyncio
 import random
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+from playwright_stealth import Stealth
 import database
 from ai_analyzer import is_vacancy_suitable, generate_cover_letter
 from config import SEARCH_QUERIES
@@ -30,7 +30,7 @@ class HHClient:
             self.context = await self.browser.new_context(user_agent=user_agent)
         
         self.page = await self.context.new_page()
-        await stealth_async(self.page)
+        await Stealth().apply_stealth_async(self.page)
 
     async def login_if_needed(self):
         print("Переходим на HH.ru для проверки авторизации...")
@@ -118,7 +118,7 @@ class HHClient:
                     
                         print(f"👁️ Открываем вакансию: {title}")
                         page = await self.context.new_page()
-                        await stealth_async(page)
+                        await Stealth().apply_stealth_async(page)
                         try:
                             await page.goto(href)
                             await asyncio.sleep(2)
@@ -312,7 +312,7 @@ class HHClient:
             chat_link = await title_loc.get_attribute("href")
             if chat_link:
                 chat_page = await self.context.new_page()
-                await stealth_async(chat_page)
+                await Stealth().apply_stealth_async(chat_page)
                 await chat_page.goto(f"https://hh.ru{chat_link}")
                 await asyncio.sleep(3)
                 
