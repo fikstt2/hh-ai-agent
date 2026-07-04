@@ -128,7 +128,6 @@ class HHClient:
                             while not await desc_loc.is_visible():
                                 print(f"⚠️ Описание не найдено. Возможно, вылезла капча: {title}")
                                 import tg_bot
-                                import random
                                 
                                 try:
                                     # Делаем скриншот видимой области (без full_page, чтобы не триггерить ресайз окна)
