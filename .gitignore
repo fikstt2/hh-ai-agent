@@ -1,6 +1,15 @@
 .env
+profile.yaml
 state.json
-agent.db
+storage_state*.json
+*.db
+*.db-*
+backups/
+.browser-profile*/
+.browser-smoke-profile/
+*.log
+*.log.*
+captcha*.png
 __pycache__/
 *.pyc
 .venv/

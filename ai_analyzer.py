@@ -1,97 +1,138 @@
+from __future__ import annotations
+
+import json
+import logging
+import math
+from collections.abc import Awaitable, Callable
+from dataclasses import asdict, dataclass
+
 import aiohttp
-from config import OLLAMA_URL, OLLAMA_MODEL, MY_RESUME_SUMMARY
 
-async def generate_cover_letter(vacancy_title: str, vacancy_description: str) -> str:
-    prompt = f"""
-Напиши сопроводительное письмо для отклика на вакансию.
-Мой профиль:
-{MY_RESUME_SUMMARY}
+from config import Settings
 
-Вакансия: {vacancy_title}
-Описание: {vacancy_description}
 
-КРИТИЧЕСКИЕ ПРАВИЛА (СТРОГО СОБЛЮДАТЬ):
-1. ПИСАТЬ СТРОГО ТОЛЬКО НА РУССКОМ ЯЗЫКЕ! Никакого английского текста.
-2. Пиши развернуто, структурировано (3-4 абзаца).
-3. Стиль: живой, профессиональный, уверенный.
-4. Включай в письмо перечисление моего стека технологий, упоминание высшего образования и опыта работы с ИИ из моего профиля.
-5. Обязательно упомяни мой пет-проект VisionForge и ВСЕГДА вставляй ссылку на мой GitHub: https://github.com/fikstt2
-6. Никаких подписей в начале письма! Только в самом конце.
-7. Подпись строго: "Евгений". Никаких "С уважением".
-8. ВЫВОДИ ТОЛЬКО ТЕКСТ ПИСЬМА БЕЗ КАВЫЧЕК. Твой ответ копируется автоматически! Строго запрещены любые вводные фразы (например, "Here is a sample...", "Вот письмо:"). Ни слова, кроме самого письма.
+logger = logging.getLogger(__name__)
+Requester = Callable[[dict], Awaitable[str]]
 
-Пример хорошего письма:
-Привет!
 
-Заинтересовала вакансия {vacancy_title}. Я программист с опытом разработки на Python, C, C++. Интересуюсь backend-разработкой, фулстек-задачами и Computer Vision. Готов решать сложные задачи и быстро обучаюсь.
+class ModelResponseError(ValueError):
+    pass
 
-Я владею инструментами ИИ и могу сам быстро обучить себя чему угодно. Имею опыт обучения моделей компьютерного зрения для задач детекции и классификации. Высшее образование по направлению "Информатика и вычислительная техника".
 
-Мой стек: Python, C++, C, Docker, SQL, FastAPI, PyQt, HTML, JS, TensorFlow, PyTorch, PostgreSQL, Linux.
+@dataclass(frozen=True)
+class SuitabilityResult:
+    suitable: bool
+    confidence: float
+    reason: str
 
-Отдельно хочу упомянуть свой пет-проект VisionForge — это фулстек-решение для компьютерного зрения, которое я реализовал на Python и PyQt5 (код тут: https://github.com/fikstt2). Я готов проходить тестовые задания и собеседования.
 
-Буду рад пообщаться подробнее!
-
-Евгений
-"""
-    
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False
-    }
-    
+def parse_suitability(raw: str) -> SuitabilityResult:
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(OLLAMA_URL, json=payload) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    text = data.get("response", "").strip()
-                    # Жесткая очистка от частых галлюцинаций LLM
-                    text = text.replace('"', '').replace("'", "")
-                    if "Here is" in text or "Here's" in text:
-                        text = text.split("\n\n", 1)[-1]
-                    if "Note:" in text:
-                        text = text.split("Note:")[0].strip()
-                    return text.strip()
-    except Exception as e:
-        print(f"Ошибка при обращении к Ollama (письмо): {e}")
-        return "Здравствуйте! Прошу рассмотреть мое резюме на эту вакансию. Буду рад обсудить детали на собеседовании."
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ModelResponseError("response is not valid JSON") from exc
+    if not isinstance(data, dict) or set(data) != {"suitable", "confidence", "reason"}:
+        raise ModelResponseError("response must contain suitable, confidence and reason")
+    if type(data["suitable"]) is not bool:
+        raise ModelResponseError("suitable must be a boolean")
+    confidence = data["confidence"]
+    if type(confidence) not in {int, float} or not math.isfinite(confidence):
+        raise ModelResponseError("confidence must be a finite number")
+    if not 0 <= confidence <= 1:
+        raise ModelResponseError("confidence must be between 0 and 1")
+    reason = data["reason"]
+    if not isinstance(reason, str) or not reason.strip():
+        raise ModelResponseError("reason must be a non-empty string")
+    return SuitabilityResult(data["suitable"], float(confidence), reason.strip())
 
-async def is_vacancy_suitable(vacancy_title: str, vacancy_description: str) -> bool:
-    prompt = f"""
-Твоя задача — оценить, подходит ли вакансия под мои критерии поиска.
-Мои требования и профиль (внимательно учти желаемую зарплату, локацию и стек технологий):
-{MY_RESUME_SUMMARY}
 
-Также мне СТРОГО НЕ подходят (отклоняй сразу, отвечая NO):
-- Вакансии уровня Senior (Сеньор), Lead или Архитектор.
-- Вакансии, где требуется опыт работы более 3 лет (у меня от 1 до 3 лет опыта).
-- Вакансии из других сфер: менеджеры, аналитики, HR, маркетологи, дизайнеры, преподаватели, риелторы, продавцы, слесари, инженеры по эксплуатации и техподдержка.
-- Любые вакансии, которые НЕ связаны напрямую с написанием кода и разработкой ПО (Backend, Fullstack, C++, Python, Computer Vision). Если вакансия не про программирование — сразу пиши NO.
+class OllamaAnalyzer:
+    def __init__(self, settings: Settings, requester: Requester | None = None):
+        self.settings = settings
+        self._requester = requester or self._request_ollama
 
-Вакансия:
-Название: {vacancy_title}
-Описание: {vacancy_description}
-
-Если вакансия подходит под мои критерии, ответь ТОЛЬКО одним словом: YES.
-Если не подходит, ответь ТОЛЬКО одним словом: NO.
-"""
-    
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False
-    }
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(OLLAMA_URL, json=payload, timeout=30) as response:
+    async def _request_ollama(self, payload: dict) -> str:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(self.settings.ollama_url, json=payload) as response:
                 response.raise_for_status()
-                data = await response.json()
-                answer = data.get("response", "").strip().upper()
-                return "YES" in answer
-    except Exception as e:
-        print(f"Ошибка при обращении к Ollama (анализ): {e}")
-        return False
+                try:
+                    data = await response.json()
+                except ValueError as exc:
+                    raise ModelResponseError("Ollama returned invalid JSON") from exc
+        if not isinstance(data, dict):
+            raise ModelResponseError("Ollama response must be a JSON object")
+        text = data.get("response")
+        if not isinstance(text, str):
+            raise ModelResponseError("Ollama response field must be a string")
+        return text
+
+    def _profile_json(self) -> str:
+        return json.dumps(
+            asdict(self.settings.profile.candidate), ensure_ascii=False, indent=2
+        )
+
+    async def assess(self, vacancy_title: str, vacancy_description: str) -> SuitabilityResult:
+        prompt = f"""Evaluate whether this vacancy fits the candidate profile.
+Return only one JSON object with exactly these fields:
+{{"suitable": true, "confidence": 0.82, "reason": "Short explanation"}}
+
+Candidate profile (the only source of candidate facts):
+{self._profile_json()}
+
+Vacancy title:
+{vacancy_title}
+
+Vacancy description:
+{vacancy_description}
+
+Do not infer missing experience, skills, education, projects, names, or links.
+Confidence must be a number from 0 to 1.
+"""
+        payload = {
+            "model": self.settings.ollama_model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+        }
+        for attempt in range(2):
+            try:
+                return parse_suitability(await self._requester(payload))
+            except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
+                logger.warning("llm_invalid_response attempt=%s error=%s", attempt + 1, exc)
+        return SuitabilityResult(False, 0.0, "Invalid model response")
+
+    async def generate_cover_letter(
+        self, vacancy_title: str, vacancy_description: str
+    ) -> str:
+        cover = self.settings.profile.cover_letter
+        prompt = f"""Write a cover letter in {cover.language} using a {cover.style} style.
+
+Candidate profile (the only source of candidate facts):
+{self._profile_json()}
+
+Vacancy title:
+{vacancy_title}
+
+Vacancy description:
+{vacancy_description}
+
+Do not invent experience, projects, education, technologies, names, links,
+achievements, availability, or promises that are absent from the profile.
+Use only relevant profile facts. Return only the letter text. The hard limit is
+{cover.max_length} characters.
+"""
+        payload = {
+            "model": self.settings.ollama_model,
+            "prompt": prompt,
+            "stream": False,
+        }
+        for attempt in range(2):
+            try:
+                letter = (await self._requester(payload)).strip()
+                if not letter:
+                    raise ModelResponseError("cover letter is empty")
+                return letter[: cover.max_length]
+            except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
+                logger.warning("llm_letter_failed attempt=%s error=%s", attempt + 1, exc)
+        return ""
