@@ -1,0 +1,24 @@
+candidate:
+  name: ""
+  location: ""
+  desired_positions: []
+  experience_summary: ""
+  education: ""
+  technologies: []
+  projects: []
+  github_url: ""
+  salary_expectation: ""
+  work_format: []
+  excluded_positions: []
+  additional_information: ""
+
+hh:
+  resume_name: ""
+  search_queries: []
+  areas: []
+  experience_filters: []
+
+cover_letter:
+  language: "ru"
+  max_length: 1800
+  style: "professional"

@@ -1,435 +1,408 @@
-import os
-import asyncio
-import random
-from playwright.async_api import async_playwright
-from playwright_stealth import Stealth
-import database
-from ai_analyzer import is_vacancy_suitable, generate_cover_letter
-from config import SEARCH_QUERIES
+from __future__ import annotations
 
-STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
-# Сколько раз пробовать откликнуться, пока hh не подтвердит отправку. После этого
-# вакансия помечается обработанной: обычно там анкета работодателя.
-MAX_RESPONSE_ATTEMPTS = 3
+import asyncio
+import logging
+import random
+import tempfile
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlencode, urlparse
+from uuid import uuid4
+
+from approval import ApplicationPermission, ApprovalGuard
+from config import Settings
+from database import Database
+
+
+logger = logging.getLogger(__name__)
+
+
+class PageState(str, Enum):
+    VACANCY_LOADED = "vacancy_loaded"
+    CAPTCHA_DETECTED = "captcha_detected"
+    ACCESS_DENIED = "access_denied"
+    VACANCY_REMOVED = "vacancy_removed"
+    PAGE_STRUCTURE_CHANGED = "page_structure_changed"
+    NETWORK_ERROR = "network_error"
+
+
+@dataclass(frozen=True)
+class VacancySummary:
+    id: str
+    title: str
+    url: str
+    search_query: str
+
+
+@dataclass(frozen=True)
+class VacancyDetails:
+    summary: VacancySummary
+    state: PageState
+    company: str = ""
+    description: str = ""
+    error: str = ""
+
+
+CaptchaSolver = Callable[[Path, str, int], Awaitable[str | None]]
+
+
+async def classify_page(page: Any) -> PageState:
+    try:
+        checks = (
+            (PageState.CAPTCHA_DETECTED, ('form[action*="captcha"]', '[data-qa="captcha"]')),
+            (PageState.ACCESS_DENIED, ('[data-qa="access-denied"]',)),
+            (PageState.VACANCY_REMOVED, ('[data-qa="vacancy-removed"]',)),
+            (PageState.VACANCY_LOADED, ('[data-qa="vacancy-description"]',)),
+        )
+        for state, selectors in checks:
+            for selector in selectors:
+                if await page.locator(selector).is_visible():
+                    return state
+        return PageState.PAGE_STRUCTURE_CHANGED
+    except Exception:
+        return PageState.NETWORK_ERROR
+
 
 class HHClient:
-    def __init__(self):
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
+    def __init__(
+        self,
+        context: Any,
+        settings: Settings,
+        database: Database,
+        approval_guard: ApprovalGuard,
+        *,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        now_factory: Callable[[], datetime] | None = None,
+    ):
+        self.context = context
+        self.settings = settings
+        self.database = database
+        self.approval_guard = approval_guard
+        self.sleep = sleep
+        self.now_factory = now_factory or (lambda: datetime.now(UTC))
 
-    async def start(self):
-        self.playwright = await async_playwright().start()
-        # Запуск в headless=False для того, чтобы в первый раз пользователь мог войти (ввести смс/пароль),
-        # либо полностью headless, если state.json существует.
-        headless = os.path.exists(STATE_FILE)
-        self.browser = await self.playwright.chromium.launch(headless=headless)
-        
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-        if os.path.exists(STATE_FILE):
-            self.context = await self.browser.new_context(storage_state=STATE_FILE, user_agent=user_agent)
-        else:
-            self.context = await self.browser.new_context(user_agent=user_agent)
-        
-        # Холодный профиль платит за антибот-проверку hh на первой навигации,
-        # и это легко превышает дефолтные 30 секунд Playwright.
-        self.context.set_default_navigation_timeout(90000)
+    async def _delay(self) -> None:
+        await self.sleep(
+            self.settings.min_seconds_between_actions + random.uniform(0.5, 2.5)
+        )
 
-        self.page = await self.context.new_page()
-        await Stealth().apply_stealth_async(self.page)
-
-    async def _response_confirmed(self, page, href: str) -> bool:
-        """Проверяет у самого hh.ru, что отклик действительно создан.
-
-        Признак: на вакансии с существующим откликом hh убирает кнопку
-        «Откликнуться». Само отсутствие кнопки ничего не доказывает — её нет
-        и на капче, и на архивной вакансии, поэтому сначала убеждаемся, что
-        перед нами действительно страница вакансии.
-        """
+    async def ensure_login(self) -> bool:
+        page = await self.context.new_page()
         try:
-            await page.goto(href.split("?")[0], wait_until="domcontentloaded")
-            await page.locator('div[data-qa="vacancy-description"]').wait_for(
-                state="visible", timeout=20000)
-        except Exception as e:
-            # Не смогли посмотреть страницу — подтверждения нет. Лучше повторить
-            # попытку, чем записать несуществующий отклик как успешный.
-            print(f"⚠️ Не удалось проверить статус отклика: {e}")
+            for attempt in range(1, 4):
+                try:
+                    await page.goto(
+                        "https://hh.ru/",
+                        wait_until="domcontentloaded",
+                        timeout=90_000,
+                    )
+                    login = page.locator(
+                        'a:has-text("Войти"), button:has-text("Войти")'
+                    ).first
+                    if not await login.is_visible():
+                        return True
+                    if self.settings.browser_headless:
+                        logger.error("hh_login_required headless=true")
+                        return False
+                    await asyncio.to_thread(
+                        input,
+                        "Sign in to HH.ru in the opened browser, then press Enter here: ",
+                    )
+                    await page.reload(wait_until="domcontentloaded")
+                    return not await login.is_visible()
+                except Exception as exc:
+                    logger.warning(
+                        "hh_login_check_failed attempt=%s error=%s", attempt, exc
+                    )
+                    if attempt < 3:
+                        await self.sleep(120)
+            return False
+        finally:
+            await page.close()
+
+    async def _response_confirmed(self, page: Any, url: str) -> bool:
+        try:
+            await page.goto(url.split("?")[0], wait_until="domcontentloaded", timeout=30_000)
+            await page.locator('[data-qa="vacancy-description"]').wait_for(
+                state="visible", timeout=20_000
+            )
+            response_control = page.locator(
+                'a[data-qa="vacancy-response-link-top"], '
+                'button[data-qa="vacancy-response-link-top"]'
+            ).first
+            return await response_control.count() == 0
+        except Exception as exc:
+            logger.warning("application_confirmation_failed error=%s", exc)
             return False
 
-        return await page.locator('a[data-qa="vacancy-response-link-top"]').count() == 0
-
-    async def login_if_needed(self):
-        print("Переходим на HH.ru для проверки авторизации...")
-        # domcontentloaded, а не load: hh.ru держит websocket чатов и аналитику,
-        # событие load может не наступить вовсе и уронить весь запуск по таймауту.
-        await self.page.goto("https://hh.ru/", wait_until="domcontentloaded")
-        await asyncio.sleep(3)
-
-        # Ждем не networkidle (по той же причине он может не наступить никогда),
-        # а конкретный маркер отрисованной шапки: ссылку на резюме у авторизованного
-        # либо кнопку входа у гостя.
+    async def search_vacancies(
+        self,
+        query: str,
+        areas: tuple[str, ...],
+        experience_filters: tuple[str, ...],
+    ) -> list[VacancySummary]:
+        results: list[VacancySummary] = []
+        page = await self.context.new_page()
         try:
-            await self.page.locator(
-                'a[href*="/applicant/resumes"], a:has-text("Войти"), button:has-text("Войти")'
-            ).first.wait_for(timeout=30000)
-        except Exception:
-            print("⚠️ Шапка hh.ru не отрисовалась за 30 с — проверяю страницу как есть.")
-        await asyncio.sleep(2)
-        
-        # Ищем любую ссылку или кнопку с текстом "Войти"
-        login_link = self.page.locator('a:has-text("Войти")')
-        login_button = self.page.locator('button:has-text("Войти")')
-        
-        if not await login_link.count() and not await login_button.count():
-            print("Уже авторизованы (кнопка 'Войти' не найдена).")
+            for page_number in range(self.settings.max_pages_per_query):
+                params: dict[str, Any] = {
+                    "text": query,
+                    "order_by": "publication_time",
+                    "page": page_number,
+                }
+                if areas:
+                    params["area"] = list(areas)
+                if experience_filters:
+                    params["experience"] = list(experience_filters)
+                await self._delay()
+                await page.goto(
+                    f"https://hh.ru/search/vacancy?{urlencode(params, doseq=True)}",
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+                cards = await page.locator('a[data-qa="serp-item__title"]').all()
+                if not cards:
+                    break
+                for card in cards:
+                    href = await card.get_attribute("href")
+                    title = (await card.inner_text()).strip()
+                    if not href:
+                        continue
+                    job_id = urlparse(href).path.rstrip("/").split("/")[-1]
+                    if job_id and self.database.get(job_id) is None:
+                        results.append(VacancySummary(job_id, title, href, query))
+                    if len(results) >= self.settings.max_vacancies_per_query:
+                        return results
+                await self._delay()
+            return results
+        except Exception as exc:
+            logger.error("vacancy_search_failed query=%r error=%s", query, exc)
+            return results
+        finally:
+            await page.close()
+
+    async def read_vacancy(
+        self,
+        summary: VacancySummary,
+        captcha_solver: CaptchaSolver | None = None,
+    ) -> VacancyDetails:
+        page = None
+        try:
+            page = await self.context.new_page()
+            await self._delay()
+            await page.goto(summary.url, wait_until="domcontentloaded", timeout=30_000)
+            state = await classify_page(page)
+            if state is PageState.CAPTCHA_DETECTED and captcha_solver is not None:
+                state = await self._solve_captcha(page, summary, captcha_solver)
+            if state is not PageState.VACANCY_LOADED:
+                if state is PageState.CAPTCHA_DETECTED:
+                    logger.warning("captcha_detected job_id=%s", summary.id)
+                return VacancyDetails(summary, state)
+            description = (
+                await page.locator('[data-qa="vacancy-description"]').inner_text()
+            ).strip()
+            if not description:
+                return VacancyDetails(
+                    summary,
+                    PageState.PAGE_STRUCTURE_CHANGED,
+                    error="vacancy description is empty",
+                )
+            company_locator = page.locator('[data-qa="vacancy-company-name"]')
+            company = (
+                (await company_locator.inner_text()).strip()
+                if await company_locator.is_visible()
+                else ""
+            )
+            return VacancyDetails(summary, state, company, description)
+        except Exception as exc:
+            return VacancyDetails(summary, PageState.NETWORK_ERROR, error=str(exc))
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception as exc:
+                    logger.warning(
+                        "vacancy_page_close_failed job_id=%s error=%s",
+                        summary.id,
+                        exc,
+                    )
+
+    async def _solve_captcha(
+        self, page: Any, summary: VacancySummary, solver: CaptchaSolver
+    ) -> PageState:
+        for _ in range(self.settings.captcha_max_attempts):
+            screenshot = Path(tempfile.gettempdir()) / f"hh-captcha-{uuid4().hex}.png"
+            try:
+                await page.screenshot(path=screenshot)
+                solution = await solver(
+                    screenshot, summary.title, self.settings.captcha_timeout_seconds
+                )
+                if not solution:
+                    return PageState.CAPTCHA_DETECTED
+                field = page.locator('input[type="text"]').first
+                if not await field.is_visible():
+                    return PageState.PAGE_STRUCTURE_CHANGED
+                await field.fill(solution)
+                submit = page.locator(
+                    'button[type="submit"]:visible, button:has-text("Отправить"):visible'
+                ).first
+                if await submit.is_visible():
+                    await submit.click()
+                else:
+                    await field.press("Enter")
+                await self.sleep(1)
+                state = await classify_page(page)
+                if state is not PageState.CAPTCHA_DETECTED:
+                    return state
+            finally:
+                screenshot.unlink(missing_ok=True)
+        return PageState.CAPTCHA_DETECTED
+
+    async def submit_application(self, permission: ApplicationPermission) -> bool:
+        claim = self.approval_guard.claim(permission)
+        if not claim.allowed or claim.vacancy is None:
+            logger.warning(
+                "application_blocked job_id=%s reason=%s",
+                permission.job_id,
+                claim.reason,
+            )
+            return False
+
+        vacancy = claim.vacancy
+        page = None
+        try:
+            page = await self.context.new_page()
+            await self._delay()
+            await page.goto(vacancy.url, wait_until="domcontentloaded", timeout=30_000)
+            response_button = page.locator(
+                'a[data-qa="vacancy-response-link-top"], button[data-qa="vacancy-response-link-top"]'
+            ).first
+            if not await response_button.is_visible():
+                raise RuntimeError("application response control was not found")
+            await response_button.click()
+            await self._delay()
+
+            resume_name = self.settings.profile.hh.resume_name
+            resume_selector = page.locator(
+                '[data-qa*="resume-select"], [data-qa*="resume-selector"]'
+            ).first
+            if resume_name and await resume_selector.is_visible():
+                await resume_selector.click()
+                option = page.get_by_text(resume_name, exact=True).first
+                if not await option.is_visible():
+                    raise RuntimeError("configured resume was not found")
+                await option.click()
+
+            if await page.locator('textarea[name^="task_"]').count() > 0:
+                raise RuntimeError("employer questionnaire requires a manual application")
+
+            letter_toggle = (
+                page.locator('[data-qa*="letter-toggle"]')
+                .or_(page.get_by_text("Написать сопроводительное", exact=True))
+                .or_(page.get_by_text("Добавить сопроводительное", exact=True))
+                .first
+            )
+            if await letter_toggle.is_visible():
+                await letter_toggle.click()
+            textarea = page.locator('textarea:not([name^="task_"])').first
+            await textarea.wait_for(state="visible", timeout=3_000)
+            await textarea.fill(vacancy.cover_letter)
+            await self._delay()
+
+            submit_button = page.locator(
+                'button[data-qa*="vacancy-response-submit"]:visible'
+            ).first
+            if not await submit_button.is_visible():
+                raise RuntimeError("final application button was not found")
+            if not self.database.mark_submit_attempt(
+                permission.job_id,
+                permission.permit,
+                now=self.now_factory(),
+                daily_limit=self.settings.max_applications_per_day,
+            ):
+                error = "application permission failed final pre-submit validation"
+                self.database.complete_application(
+                    permission.job_id,
+                    permission.permit,
+                    success=False,
+                    now=self.now_factory(),
+                    error_text=error,
+                )
+                logger.warning(
+                    "application_blocked job_id=%s reason=pre_submit_recheck",
+                    permission.job_id,
+                )
+                return False
+            await submit_button.click()
+            success_marker = (
+                page.locator(
+                    '[data-qa="vacancy-response-success"], '
+                    '[data-qa="vacancy-response-link-view-topic"]'
+                )
+                .or_(page.get_by_text("Отклик отправлен", exact=False))
+                .first
+            )
+            await success_marker.wait_for(state="visible", timeout=5_000)
+            if not await self._response_confirmed(page, vacancy.url):
+                raise RuntimeError("HH.ru did not confirm the application")
+            if not self.database.complete_application(
+                permission.job_id,
+                permission.permit,
+                success=True,
+                now=self.now_factory(),
+            ):
+                raise RuntimeError("application status could not be completed")
+            logger.info("application_sent job_id=%s", permission.job_id)
             return True
-
-        if os.path.exists(STATE_FILE):
-            os.remove(STATE_FILE)
-            print("❌ Файл сессии (state.json) недействителен. Я его удалил.")
-            print("Пожалуйста, перезапустите скрипт (python main.py), чтобы открылось окно браузера для входа.")
+        except Exception as exc:
+            self.database.complete_application(
+                permission.job_id,
+                permission.permit,
+                success=False,
+                now=self.now_factory(),
+                error_text=str(exc),
+            )
+            logger.error("application_failed job_id=%s error=%s", permission.job_id, exc)
             return False
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception as exc:
+                    logger.warning(
+                        "application_page_close_failed job_id=%s error=%s",
+                        permission.job_id,
+                        exc,
+                    )
 
-        print("=========================================")
-        print("❗ НУЖНА АВТОРИЗАЦИЯ ❗")
-        print("1. В открывшемся браузере войдите в свой аккаунт HH.ru.")
-        print("2. Дождитесь, пока загрузится ваш профиль.")
-        print("3. ВЕРНИТЕСЬ В ЭТО ОКНО КОНСОЛИ И НАЖМИТЕ КЛАВИШУ ENTER.")
-        print("=========================================")
-        
+    async def check_messages(
+        self, notifier: Callable[[str], Awaitable[None]]
+    ) -> None:
+        page = await self.context.new_page()
         try:
-            # Ожидаем нажатия Enter (в отдельном потоке, чтобы не блокировать асинхронность)
-            await asyncio.to_thread(input, "👉 Нажмите ENTER здесь, когда войдете в аккаунт: ")
-            
-            print("⏳ Сохраняем сессию...")
-            await asyncio.sleep(2) # На всякий случай даем странице загрузиться
-            await self.context.storage_state(path=STATE_FILE)
-            print("✅ Авторизация успешна, состояние сохранено!")
-            return True
-        except Exception as e:
-            print(f"❌ Произошла ошибка при сохранении авторизации: {e}")
-            return False
-
-    async def search_and_apply(self, send_notification_func):
-        print("Начинаем поиск вакансий...")
-        for query in SEARCH_QUERIES:
-            print(f"\n======================================")
-            print(f"🔍 Поиск по запросу: {query}")
-            print(f"======================================")
-            
-            # Два режима поиска: сначала Питер (все графики), потом РФ (только удаленка)
-            search_configs = [
-                {"name": "Санкт-Петербург (любой график)", "params": "&area=2"},
-                {"name": "Вся Россия (только удаленка)", "params": "&area=113&schedule=remote"}
-            ]
-            
-            for config in search_configs:
-                print(f"📍 Режим: {config['name']}")
-                url = f"https://hh.ru/search/vacancy?text={query}&order_by=publication_time&experience=noExperience&experience=between1And3{config['params']}"
-                await self.page.goto(url)
-                await asyncio.sleep(3)
-                page_num = 1
-                while True:
-                    print(f"📄 Парсим страницу {page_num} по запросу '{query}' ({config['name']})...")
-                    vacancies = await self.page.locator('a[data-qa="serp-item__title"]').all()
-                
-                    # Собираем ссылки заранее, чтобы избежать ошибки Detached Node при долгом парсинге
-                    links_to_process = []
-                    for v in vacancies:
-                        href = await v.get_attribute("href")
-                        title = await v.inner_text()
-                        if href:
-                            links_to_process.append((title, href))
-                        
-                    for title, href in links_to_process:
-                        # Парсим ID вакансии из URL (https://hh.ru/vacancy/123456?...)
-                        job_id = None
-                        if "vacancy/" in href:
-                            job_id = href.split("vacancy/")[1].split("?")[0]
-                    
-                        if not job_id or database.is_job_applied(job_id):
-                            # print(f"Пропускаем (уже обработано): {title}") # Раскомментировать, если нужно видеть все пропуски
-                            continue
-                    
-                        print(f"👁️ Открываем вакансию: {title}")
-                        page = await self.context.new_page()
-                        await Stealth().apply_stealth_async(page)
-                        try:
-                            await page.goto(href)
-                            await asyncio.sleep(2)
-                        
-                            desc_loc = page.locator('div[data-qa="vacancy-description"]')
-                            # Если описания нет - возможно капча. Запускаем цикл решения.
-                            while not await desc_loc.is_visible():
-                                print(f"⚠️ Описание не найдено. Возможно, вылезла капча: {title}")
-                                import tg_bot
-                                
-                                try:
-                                    # Делаем скриншот видимой области (без full_page, чтобы не триггерить ресайз окна)
-                                    await page.screenshot(path="captcha.png")
-                                    await tg_bot.send_captcha_request("captcha.png", f"🚨 <b>Подозрение на капчу!</b>\nБот застрял на вакансии <i>{title}</i>.\n\nПожалуйста, введите текст с картинки прямо в этот чат (если там два слова, введите через пробел):")
-                                    
-                                    print("Ожидаем ввод капчи из Telegram...")
-                                    # Ожидание снятия блокировки (когда юзер введет текст)
-                                    await tg_bot.captcha_event.wait()
-                                    
-                                    # Вводим текст
-                                    solution = tg_bot.captcha_solution
-                                    print(f"Вводим решение: {solution}")
-                                    
-                                    input_field = page.locator('input[type="text"]').first
-                                    if await input_field.is_visible():
-                                        await input_field.click()
-                                        await asyncio.sleep(random.uniform(0.5, 1.2))
-                                        
-                                        for char in solution:
-                                            if char == " ":
-                                                await asyncio.sleep(random.uniform(0.6, 1.5)) # Медленный пробел между словами
-                                            await input_field.type(char, delay=random.randint(150, 400)) # Человечный ввод
-                                            
-                                        await asyncio.sleep(random.uniform(1.0, 2.5))
-                                        # На форме капчи есть кнопка «Отправить»; Enter в React-форме
-                                        # её не сабмитит, и верно введенный код никуда не уходит —
-                                        # бот крутится в цикле, запрашивая новую картинку.
-                                        submit_captcha = page.locator(
-                                            'button[type="submit"]:visible, button:has-text("Отправить"):visible'
-                                        ).first
-                                        try:
-                                            if await submit_captcha.is_visible():
-                                                await submit_captcha.click()
-                                            else:
-                                                await input_field.press('Enter')
-                                        except Exception:
-                                            await input_field.press('Enter')
-                                        await asyncio.sleep(6) # Ждем прогрузки после ввода
-                                    else:
-                                        # Если поля ввода нет (возможно это галочка Cloudflare или вы уже решили её в другом браузере)
-                                        # Просто обновляем страницу, чтобы проверить, не снят ли бан по IP
-                                        print("Поле ввода не найдено. Обновляем страницу...")
-                                        await page.reload()
-                                        await asyncio.sleep(4)
-                                    
-                                    # Проверяем, появилось ли описание
-                                    desc_loc = page.locator('div[data-qa="vacancy-description"]')
-                                    if await desc_loc.is_visible():
-                                        try:
-                                            await send_notification_func("✅ Капча успешно пройдена! Бот продолжает работу.")
-                                        except:
-                                            pass
-                                        print("✅ Капча пройдена!")
-                                        break # Выходим из цикла решения капчи
-                                    else:
-                                        try:
-                                            await send_notification_func("❌ Капча решена неверно (или появилась новая). Пробуем еще раз!")
-                                        except:
-                                            pass
-                                        print("❌ Капча не пройдена. Повторная попытка...")
-                                        # Цикл while начнется заново: сделает новый скриншот и попросит ввод
-                                        
-                                except Exception as e:
-                                    print(f"Ошибка при обработке капчи: {e}")
-                                    break # В случае системной ошибки выходим, чтобы не зациклиться
-                            description = await desc_loc.inner_text()
-
-                            # Базовый жесткий фильтр по названию, чтобы не пускать ИИ на очевидные сеньорские позиции, стажировки или неайтишные профессии
-                            title_lower = title.lower()
-                            stop_words = [
-                                "senior", "сеньор", "lead", "лид", "architect", "архитектор", "руководитель", "главный", 
-                                "стажер", "intern", "trainee", "стажировка", "менеджер", "manager", "дизайнер", "designer", 
-                                "hr", "аналитик", "analyst", "преподаватель", "педагог", "маркетолог", "продаж", "1с", "1c",
-                                "слесарь", "диспетчер", "ассистент", "риелтор", "учитель"
-                            ]
-                            if any(word in title_lower for word in stop_words):
-                                print(f"⏩ Пропускаем (Неподходящий грейд/профессия): {title}")
-                                continue
-                            
-                            # Анализ ИИ
-                            if await is_vacancy_suitable(title, description):
-                                print(f"✨ Вакансия подходит: {title}")
-                            
-                                cover_letter = await generate_cover_letter(title, description)
-                            
-                                # Пробуем откликнуться
-                                apply_btn = page.locator('a[data-qa="vacancy-response-link-top"]').first
-                                if await apply_btn.is_visible():
-                                    # Имитируем поведение человека перед откликом
-                                    await page.mouse.move(random.randint(100, 700), random.randint(100, 500))
-                                    await page.mouse.wheel(0, random.randint(200, 600))
-                                    await asyncio.sleep(random.uniform(0.8, 1.5))
-                                    await page.mouse.wheel(0, random.randint(-200, 100))
-                                    await asyncio.sleep(random.uniform(0.5, 1.0))
-                                    
-                                    await apply_btn.click()
-                                    # Даем время на открытие попапа ИЛИ загрузку новой страницы отклика
-                                    await asyncio.sleep(3)
-                                
-                                    # Шаг 0: Выбор нужного резюме (если их несколько)
-                                    try:
-                                        from config import TARGET_RESUME_NAME
-                                        if TARGET_RESUME_NAME:
-                                            resume_dropdown = page.locator('[data-qa*="resume-select"], [data-qa*="resume-selector"], [data-qa="vacancy-response-resume-selector"]').first
-                                            if await resume_dropdown.is_visible():
-                                                await resume_dropdown.click()
-                                                await asyncio.sleep(1)
-                                                # Кликаем по нужному резюме из выпадающего списка
-                                                target_resume_btn = page.locator(f'text="{TARGET_RESUME_NAME}"').first
-                                                if await target_resume_btn.is_visible():
-                                                    await target_resume_btn.click()
-                                                    await asyncio.sleep(1)
-                                    except Exception as e:
-                                        print(f"⚠️ Ошибка при выборе резюме: {e}")
-                                
-                                    # Шаг 0.5: тест работодателя. Его поля называются task_<id>_text
-                                    # и стоят на странице ПЕРЕД полем письма, поэтому письмо уходило
-                                    # в ответ на первый вопрос теста, а отклик не создавался вовсе.
-                                    # Тест должен проходить человек — отдаем вакансию ему.
-                                    if await page.locator('textarea[name^="task_"]').count() > 0:
-                                        print(f"📝 Вакансия с тестом работодателя, нужен ручной отклик: {title}")
-                                        database.add_applied_job(job_id, title, href)
-                                        await send_notification_func(
-                                            f"📝 Тестовое задание: <a href='{href}'>{title}</a>\n\n"
-                                            f"<i>Работодатель просит ответить на вопросы — откликнитесь вручную.</i>"
-                                        )
-                                        continue
-
-                                    # Шаг 1: Ищем кнопку "Написать/Добавить сопроводительное" (если поле изначально скрыто)
-                                    toggle_btn = page.locator('[data-qa*="letter-toggle"]').or_(
-                                        page.locator('text="Написать сопроводительное"')
-                                    ).or_(
-                                        page.locator('text="Добавить сопроводительное"')
-                                    ).first
-                                    if await toggle_btn.is_visible():
-                                        try:
-                                            await toggle_btn.click()
-                                            await asyncio.sleep(1)
-                                        except:
-                                            pass
-                                
-                                    # Шаг 2: поле сопроводительного письма — именно письма, а не
-                                    # «любое textarea»: поля теста (task_*) исключены.
-                                    letter_sent = False
-                                    try:
-                                        letter_textarea = page.locator('textarea:not([name^="task_"])').first
-                                        await letter_textarea.wait_for(state="visible", timeout=3000)
-                                        await letter_textarea.fill(cover_letter)
-                                        letter_sent = True
-                                    except:
-                                        print(f"⚠️ Не удалось найти видимое поле (textarea) для письма: {title}")
-                                    
-                                    # Шаг 3: Отправка отклика (ищем любую видимую кнопку отправки)
-                                    submit_btn = page.locator('button[data-qa*="vacancy-response-submit"]:visible').first
-                                    if await submit_btn.is_visible():
-                                        await submit_btn.click() # РЕАЛЬНЫЙ ОТКЛИК
-                                        # Ждем закрытия формы, а не спим вслепую: уйти со страницы
-                                        # раньше — значит оборвать сам запрос отклика.
-                                        try:
-                                            await submit_btn.wait_for(state="hidden", timeout=20000)
-                                        except Exception:
-                                            pass
-                                        await asyncio.sleep(2)
-
-                                        # Клик != отправленный отклик: hh может потребовать
-                                        # доп. шаг или молча ничего не сделать. Спрашиваем сам сайт,
-                                        # иначе несуществующий отклик попадает в базу как успешный
-                                        # и вакансия теряется навсегда.
-                                        if not await self._response_confirmed(page, href):
-                                            attempts = database.bump_failed_response(job_id, title)
-                                            print(f"❗ Отклик НЕ подтвержден сайтом (попытка {attempts}): {title}")
-                                            if attempts >= MAX_RESPONSE_ATTEMPTS:
-                                                # Хватит: помечаем обработанной, иначе вакансия будет
-                                                # возвращаться при каждом проходе выдачи.
-                                                database.add_applied_job(job_id, title, href)
-                                                await send_notification_func(
-                                                    f"❗ Отклик так и не прошел ({attempts} попытки): "
-                                                    f"<a href='{href}'>{title}</a>\n\n"
-                                                    f"<i>hh.ru не подтвердил отправку — нужен ручной отклик.</i>"
-                                                )
-                                            continue
-
-                                        database.add_applied_job(job_id, title, href)
-
-                                        import html
-                                        safe_cover_letter = html.escape(cover_letter)
-
-                                        if letter_sent:
-                                            await send_notification_func(f"✅ Успешный отклик: <a href='{href}'>{title}</a>\n\n<b>Письмо:</b>\n<i>{safe_cover_letter}</i>")
-                                        else:
-                                            await send_notification_func(f"✅ Отклик без письма: <a href='{href}'>{title}</a>\n\n<i>(Работодатель отключил возможность отправки писем для этой вакансии)</i>")
-                                        print(f"✅ Отклик отправлен: {title}")
-                                    else:
-                                        # Форма открылась, но кнопки отправки в ней нет. Без этой ветки
-                                        # вакансия молча возвращалась в обработку на каждом проходе.
-                                        attempts = database.bump_failed_response(job_id, title)
-                                        print(f"❗ Кнопка отправки не найдена в форме (попытка {attempts}): {title}")
-                                        if attempts >= MAX_RESPONSE_ATTEMPTS:
-                                            database.add_applied_job(job_id, title, href)
-                                else:
-                                    # Кнопки нет — обычно потому, что отклик уже есть. Но так же
-                                    # выглядит недогруженная страница, поэтому не гадаем, а спрашиваем hh.
-                                    if await self._response_confirmed(page, href):
-                                        print(f"Отклик уже был отправлен ранее: {title}")
-                                        database.add_applied_job(job_id, title, href)
-                                    else:
-                                        attempts = database.bump_failed_response(job_id, title)
-                                        print(f"❗ Кнопка отклика не найдена, отклика нет (попытка {attempts}): {title}")
-                                        if attempts >= MAX_RESPONSE_ATTEMPTS:
-                                            database.add_applied_job(job_id, title, href)
-                            else:
-                                print(f"❌ ИИ отклонил: {title}")
-                                database.add_applied_job(job_id, title, href) # Добавляем, чтобы больше не анализировать
-                            
-                        except Exception as e:
-                            print(f"Ошибка при обработке вакансии {title}: {e}")
-                        finally:
-                            await page.close()
-                    
-                    # После того как все вакансии на странице обработаны, проверяем кнопку "Дальше"
-                    next_btn = self.page.locator('a[data-qa="pager-next"]')
-                    if await next_btn.count() > 0 and await next_btn.is_visible():
-                        print("➡️ Переходим на следующую страницу...")
-                        await next_btn.click()
-                        await asyncio.sleep(4)
-                        page_num += 1
-                    else:
-                        print("🛑 Больше страниц нет, переходим к следующему запросу.")
-                        break
-
-    async def check_chats(self, send_notification_func):
-        print("Проверка новых сообщений в чатах HH...")
-        await self.page.goto("https://hh.ru/applicant/negotiations")
-        await asyncio.sleep(3)
-        
-        # Находим список откликов с бейджем непрочитанных сообщений (надежный поиск через filter(has=...))
-        chat_cards = await self.page.locator('div[data-qa="negotiations-item"]').filter(has=self.page.locator('span[data-qa="negotiations-item-badge"]')).all()
-        
-        for chat_card in chat_cards:
-            
-            title_loc = chat_card.locator('a[data-qa="negotiations-item-vacancy-link"]')
-            title = await title_loc.inner_text() if await title_loc.is_visible() else "Неизвестно"
-            
-            # Переходим в чат
-            chat_link = await title_loc.get_attribute("href")
-            if chat_link:
-                chat_page = await self.context.new_page()
-                await Stealth().apply_stealth_async(chat_page)
-                await chat_page.goto(f"https://hh.ru{chat_link}")
-                await asyncio.sleep(3)
-                
-                # Получаем последнее сообщение
-                messages = await chat_page.locator('div[data-qa="chat-message-text"]').all()
-                if messages:
-                    last_msg = await messages[-1].inner_text()
-                    msg_id = f"{chat_link}_{len(messages)}" # Примитивный ID
-                    
-                    if not database.is_message_processed(msg_id):
-                        database.add_processed_message(msg_id, chat_link, last_msg)
-                        await send_notification_func(f"🔔 <b>Новое сообщение от работодателя!</b>\nВакансия: {title}\n\n<i>{last_msg}</i>\n<a href='https://hh.ru{chat_link}'>Перейти к чату</a>")
-                
-                await chat_page.close()
-
-    async def stop(self):
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
+            await self._delay()
+            await page.goto(
+                "https://hh.ru/applicant/negotiations",
+                wait_until="domcontentloaded",
+                timeout=30_000,
+            )
+            cards = await page.locator('div[data-qa="negotiations-item"]').all()
+            for card in cards:
+                badge = card.locator('span[data-qa="negotiations-item-badge"]')
+                if not await badge.is_visible():
+                    continue
+                link = card.locator('a[data-qa="negotiations-item-vacancy-link"]')
+                href = await link.get_attribute("href")
+                title = (await link.inner_text()).strip()
+                message_id = f"{href}:{title}"
+                if href and not self.database.is_message_processed(message_id):
+                    self.database.add_processed_message(message_id, href, title)
+                    await notifier(f"New unread HH message for: {title}\nhttps://hh.ru{href}")
+        except Exception as exc:
+            logger.error("message_check_failed error=%s", exc)
+        finally:
+            await page.close()
