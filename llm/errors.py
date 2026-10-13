@@ -41,6 +41,13 @@ class LLMInvalidResponseError(LLMError):
     retryable = True
 
 
+class LLMBlacklistError(LLMError):
+    """Model refused to answer due to sensitive-topic filter."""
+
+    category = "blacklist"
+    retryable = False
+
+
 class LLMUnsupportedCapabilityError(LLMError):
     category = "unsupported_capability"
 

@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from database import Database
 from llm.errors import (
     LLMAuthenticationError,
+    LLMBlacklistError,
     LLMDailyLimitError,
     LLMInvalidResponseError,
     LLMRateLimitError,
@@ -311,3 +312,82 @@ def test_close_delegates_to_the_single_selected_adapter(tmp_path: Path) -> None:
     asyncio.run(provider.close())
 
     assert adapter.closed is True
+
+
+# ---------------------------------------------------------------------------
+# LLM blacklist: GigaChat sensitive-topic refusal is NOT retryable
+# ---------------------------------------------------------------------------
+
+def test_blacklist_error_not_retried(tmp_path: Path) -> None:
+    """A policy refusal must not consume the retry budget."""
+    refusal = response(
+        text=(
+            "Извините, я не могу обсуждать эту тему. "
+            "Разговоры на некоторые темы временно ограничены."
+        )
+    )
+    provider, adapter, _ = managed(
+        tmp_path, [refusal, response()], max_retries=3
+    )
+
+    with pytest.raises(LLMBlacklistError):
+        asyncio.run(provider.generate_text(request()))
+
+    # Only one adapter call — no retry.
+    assert len(adapter.requests) == 1
+
+
+def test_blacklist_finish_reason_not_retried(tmp_path: Path) -> None:
+    """finish_reason='blacklist' is treated the same as marker text."""
+    refusal = replace(response(), finish_reason="blacklist")
+    provider, adapter, _ = managed(
+        tmp_path, [refusal, response()], max_retries=3
+    )
+
+    with pytest.raises(LLMBlacklistError):
+        asyncio.run(provider.generate_text(request()))
+
+    assert len(adapter.requests) == 1
+
+
+def test_blacklist_category_is_distinct() -> None:
+    """category='blacklist' and retryable=False are part of the public contract."""
+    assert LLMBlacklistError.category == "blacklist"
+    assert LLMBlacklistError.retryable is False
+
+
+# ---------------------------------------------------------------------------
+# JSON pre-fix: safe for valid JSON, helps GigaChat glitches
+# ---------------------------------------------------------------------------
+
+def test_valid_json_untouched_by_prefix(tmp_path: Path) -> None:
+    """Valid JSON from Mistral/OpenAI/Ollama must parse on the first try."""
+    # No GigaChat-style glitch, plain valid JSON.
+    valid = '{"suitable": true, "confidence": 0.85}'
+    provider, adapter, _ = managed(
+        tmp_path, [response(text=valid)], max_retries=1
+    )
+
+    _, parsed = asyncio.run(
+        provider.generate_structured(request(structured=True), StructuredAnswer)
+    )
+
+    assert parsed.suitable is True
+    assert parsed.confidence == 0.85
+    # Exactly one call — strict parse succeeded, no fallback attempts.
+    assert len(adapter.requests) == 1
+
+
+def test_gigachat_bracket_glitch_recovered(tmp_path: Path) -> None:
+    """The `"),` glitch is fixed by the pre-fix regex, without a retry."""
+    glitched = '{"suitable": true, "confidence": 0.9")}'
+    provider, adapter, _ = managed(
+        tmp_path, [response(text=glitched)], max_retries=0
+    )
+
+    _, parsed = asyncio.run(
+        provider.generate_structured(request(structured=True), StructuredAnswer)
+    )
+
+    assert parsed.suitable is True
+    assert parsed.confidence == 0.9

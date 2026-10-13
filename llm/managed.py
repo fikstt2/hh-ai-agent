@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import datetime
@@ -13,6 +14,7 @@ from pydantic import BaseModel, ValidationError
 from database import Database
 from llm.base import ProviderAdapter
 from llm.errors import (
+    LLMBlacklistError,
     LLMDailyLimitError,
     LLMError,
     LLMInvalidResponseError,
@@ -83,6 +85,26 @@ class ManagedLLMProvider:
                 response = await self.adapter.complete(active_request)
                 if not response.text.strip() or response.finish_reason == "length":
                     raise LLMInvalidResponseError()
+                # GigaChat (and possibly other providers) refuse sensitive topics
+                # by returning a short "policy" message. That is NOT a parse failure:
+                # retrying the same prompt wastes tokens and never succeeds.
+                _blacklist_markers = (
+                    "разговоры на некоторые темы временно ограничены",
+                    "ответы на вопросы, связанные с чувствительными темами",
+                    "собственным мнением",
+                    "чувствительные темы могут быть ограничены",
+                    "не обладает собственным мнением",
+                )
+                _txt = (response.text or "").lower()
+                if response.finish_reason == "blacklist" or any(
+                    m in _txt for m in _blacklist_markers
+                ):
+                    logger.warning(
+                        "llm_blacklist_skip provider=%s operation=%s",
+                        self.adapter.name,
+                        request.operation,
+                    )
+                    raise LLMBlacklistError()
                 parsed = None
                 if response_model is not None:
                     raw_text = response.text.strip()
@@ -97,10 +119,68 @@ class ManagedLLMProvider:
                     last_brace = raw_text.rfind("}")
                     if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
                         raw_text = raw_text[first_brace : last_brace + 1]
+
+                    parsed = None
+                    last_err: Exception | None = None
+
+                    # Attempt 1: strict parse on untampered text. This guarantees
+                    # that valid JSON from Mistral/OpenAI/Ollama is never modified.
                     try:
                         parsed = response_model.model_validate_json(raw_text)
-                    except ValidationError as exc:
-                        raise LLMInvalidResponseError() from exc
+                    except Exception as exc:
+                        last_err = exc
+
+                    # Attempt 2: GigaChat-specific pre-fix (no-op on valid JSON).
+                    # Fixes the frequent `"),` glitch where GigaChat closes a
+                    # string with `")` instead of `",`.
+                    if parsed is None:
+                        try:
+                            fixed = re.sub(r'"\)\s*,', '",', raw_text)
+                            parsed = response_model.model_validate_json(fixed)
+                        except Exception as exc:
+                            last_err = exc
+
+                    # Attempt 3: json-repair (best effort for LLM glitches).
+                    if parsed is None:
+                        try:
+                            from json_repair import repair_json as _repair
+                            fixed = _repair(raw_text, return_objects=False)
+                            parsed = response_model.model_validate_json(fixed)
+                        except Exception as exc:
+                            last_err = exc
+
+                    # Attempt 4: dirtyjson (tolerant parser).
+                    if parsed is None:
+                        try:
+                            import dirtyjson as _dirtyjson
+                            obj = _dirtyjson.loads(raw_text)
+                            parsed = response_model.model_validate(obj)
+                        except Exception as exc:
+                            last_err = exc
+
+                    # Attempt 5: python-dict normalization.
+                    if parsed is None:
+                        try:
+                            fixed = raw_text.replace("'", '"')
+                            fixed = fixed.replace("None", "null")
+                            fixed = fixed.replace("True", "true").replace(
+                                "False", "false"
+                            )
+                            parsed = response_model.model_validate_json(fixed)
+                        except Exception as exc:
+                            last_err = exc
+
+                    if parsed is None:
+                        logger.warning(
+                            "json_parse_failed provider=%s operation=%s "
+                            "raw_head=%r raw_tail=%r err=%s",
+                            self.adapter.name,
+                            request.operation,
+                            raw_text[:200],
+                            raw_text[-200:],
+                            last_err,
+                        )
+                        raise LLMInvalidResponseError() from last_err
                 self.database.complete_llm_request(
                     row_id,
                     success=True,
